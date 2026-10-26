@@ -138,9 +138,14 @@ GROUPS = [list(range(j, 87, K)) for j in range(K)]
 #             Noise2Inverse): same expectation as a single group, but its noise
 #             variance is K - 1 times lower, so the gradients are far less noisy
 #   "group"   one other group drawn at random (rounds 1-2)
+#   "cpwc"    supervised baseline, not N2I: the compound of all the transmits
+#             (87-transmit CPWC), input group included, as in supervised
+#             few-to-many-transmit networks; its runs save under a "_sup" folder
 # Validation and test map one group to another one (VAL_PAIRS), as in the
-# earlier rounds and in eval_n2i_deepinv.py.
-TARGET = "others"
+# earlier rounds and in eval_n2i_deepinv.py; with "cpwc" they map each input
+# group of VAL_PAIRS to CPWC instead, so the supervised loss selects the
+# checkpoint. The N2I_TARGET environment variable overrides it.
+TARGET = os.environ.get("N2I_TARGET", "others")
 # Pairs of groups (input, target) the validation loss is averaged over. A single
 # pair leaves the loss that selects the best checkpoint and drives early stopping
 # noisier than the differences between epochs. The test loss uses (0, 1) alone,
@@ -184,7 +189,10 @@ AUG_GAIN_DB = 0.0 if SCALE_EQUIVARIANT else 10.0
 # input is flipped upside down. The N2I_VFLIP environment variable overrides it
 # (N2I_VFLIP=0 to resume or reproduce a round-4 run).
 AUG_VFLIP = os.environ.get("N2I_VFLIP", "1") != "0"
-SAVE_PATH = f"./checkpoints/n2i_ultrasound_{ARCH}{'_vflip' if AUG_VFLIP else ''}{RUN_SUFFIX}"
+SAVE_PATH = (
+    f"./checkpoints/n2i_ultrasound_{ARCH}{'_vflip' if AUG_VFLIP else ''}"
+    f"{'_sup' if TARGET == 'cpwc' else ''}{RUN_SUFFIX}"
+)
 
 # Optimisation
 EPOCHS = 100
@@ -247,7 +255,9 @@ class Noise2InverseDataset(Dataset):
             means = np.load(self.files[idx // len(self.pairs)], mmap_mode="r")
             j, k = self.pairs[idx % len(self.pairs)]
         inp = torch.from_numpy(np.array(means[j]))
-        if self.train and TARGET == "others":
+        if TARGET == "cpwc":
+            tgt = torch.from_numpy(np.array(means[-1]))
+        elif self.train and TARGET == "others":
             # Mean of the transmits outside group j, from the mean over all of them.
             n, n_j = self.n_total, self.sizes[j]
             tgt = (n * torch.from_numpy(np.array(means[-1])) - n_j * inp) / (n - n_j)
@@ -313,7 +323,7 @@ flat = sorted(a for g in GROUPS for a in g)
 if flat != sorted(set(flat)) or not set(flat) <= set(range(manifest["n_angles"])):
     raise ValueError("GROUPS must be disjoint subsets of the transmit indices")
 
-if TARGET not in ("others", "group"):
+if TARGET not in ("others", "group", "cpwc"):
     raise ValueError(f"Unknown TARGET {TARGET!r}")
 
 # %%
@@ -498,6 +508,7 @@ class ResumableTrainer(dinv.Trainer):
         # The evaluation scripts rebuild the model from these.
         extra = {
             "scale_equivariant": SCALE_EQUIVARIANT,
+            "target": TARGET,
             "augmentation": {
                 "tgc_db": AUG_TGC_DB,
                 "tgc_knots": AUG_TGC_KNOTS,
@@ -568,7 +579,8 @@ if test_files:
             loss_identity.append(F.mse_loss(y, x).item())
     print(
         f"Test on {len(test_files)} frames from {TEST_DIRS}: "
-        f"N2I loss {np.mean(loss_n2i):.4f} (identity {np.mean(loss_identity):.4f})"
+        f"{'loss against CPWC' if TARGET == 'cpwc' else 'N2I loss'} {np.mean(loss_n2i):.4f} "
+        f"(identity {np.mean(loss_identity):.4f})"
     )
 
 # %%

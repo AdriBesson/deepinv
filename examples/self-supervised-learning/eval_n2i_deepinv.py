@@ -64,12 +64,20 @@ EVAL_DIRS = ["volunteer_002", "volunteer_006", "volunteer_008"]  # test voluntee
 #   "mean"       baseline networks, fed the mean of the transmits (2 channels)
 #   "transmits"  multi-transmit networks, fed each transmit (2 channels each)
 # and the same trained with vertical-flip augmentation, "mean_vflip" and
-# "transmits_vflip". The N2I_INPUTS environment variable overrides it, e.g.
-# N2I_INPUTS=mean,transmits,transmits_vflip.
+# "transmits_vflip"; and the supervised baselines of train_n2i_deepinv.py with
+# TARGET="cpwc", "mean_sup" and "mean_vflip_sup". The N2I_INPUTS environment
+# variable overrides it, e.g. N2I_INPUTS=mean,transmits,transmits_vflip.
 INPUTS = ["mean"]
 INPUTS = os.environ.get("N2I_INPUTS", ",".join(INPUTS)).split(",")
 # Checkpoint folder suffix of each kind, as in the SAVE_PATH of the training scripts.
-SAVE_SUFFIX = {"mean": "", "transmits": "_multitx", "mean_vflip": "_vflip", "transmits_vflip": "_multitx_vflip"}
+SAVE_SUFFIX = {
+    "mean": "",
+    "transmits": "_multitx",
+    "mean_vflip": "_vflip",
+    "transmits_vflip": "_multitx_vflip",
+    "mean_sup": "_sup",
+    "mean_vflip_sup": "_vflip_sup",
+}
 if not INPUTS or not set(INPUTS) <= set(SAVE_SUFFIX):
     raise ValueError(f"INPUTS must be among {list(SAVE_SUFFIX)}, got {INPUTS}")
 
@@ -183,9 +191,10 @@ for inputs in INPUTS:
             print(f"{NAMES[arch]} ({inputs}): no checkpoint found, skipped")
             continue
         checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
-        # Baseline checkpoints have no "input" key, older ones no "vflip".
+        # Baseline checkpoints have no "input" key, older ones no "vflip" or "target".
         vflip = checkpoint.get("augmentation", {}).get("vflip", False)
-        kind = checkpoint.get("input", "mean") + ("_vflip" if vflip else "")
+        supervised = checkpoint.get("target") == "cpwc"
+        kind = checkpoint.get("input", "mean") + ("_vflip" if vflip else "") + ("_sup" if supervised else "")
         if kind not in SAVE_SUFFIX:
             raise ValueError(f"{ckpt_path}: a '{kind}' network, not one of {list(SAVE_SUFFIX)}")
         if kind != inputs:
@@ -204,7 +213,10 @@ for inputs in INPUTS:
         )
         model.load_state_dict(checkpoint["state_dict"])
         model.eval()
-        name = NAMES[arch] + (" multi-tx" if n_tx else "") + (" vflip" if vflip else "")
+        name = (
+            NAMES[arch] + (" multi-tx" if n_tx else "") + (" vflip" if vflip else "")
+            + (" supervised" if supervised else "")
+        )
         models[name] = model, n_tx
         print(f"{name}: {ckpt_path} (epoch {checkpoint['epoch']})")
 if not models:

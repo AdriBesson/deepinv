@@ -69,6 +69,8 @@ INPUT_DIRS = ["volunteer_002/carotid", "volunteer_006/carotid", "volunteer_008"]
 #   "s2i"        Sparse2Inverse networks of train_s2i_deepinv.py
 #   "mean_anyn"  networks of train_n2i_anyn_deepinv.py, fed the mean of any
 #                number of transmits ("mean_anyn_vflip" with vertical flips)
+#   "mean_sup"   supervised baselines of train_n2i_deepinv.py with TARGET="cpwc"
+#                ("mean_vflip_sup" with vertical flips)
 # The N2I_INPUTS environment variable overrides it, e.g. N2I_INPUTS=transmits or
 # N2I_INPUTS=mean,s2i.
 INPUTS = ["transmits_vflip"]
@@ -82,6 +84,8 @@ SAVE_SUFFIX = {
     "s2i": "",
     "mean_anyn": "_anyn",
     "mean_anyn_vflip": "_anyn_vflip",
+    "mean_sup": "_sup",
+    "mean_vflip_sup": "_vflip_sup",
 }
 # Checkpoint folder prefix, s2i_ultrasound for train_s2i_deepinv.py.
 SAVE_PREFIX = {"s2i": "s2i_ultrasound"}
@@ -218,7 +222,8 @@ for inputs in INPUTS:
         # Baseline checkpoints have no "input" key, older ones no "vflip"; S2I
         # checkpoints are the only ones with "s2i_scale".
         vflip = checkpoint.get("augmentation", {}).get("vflip", False)
-        kind = checkpoint.get("input", "mean") + ("_vflip" if vflip else "")
+        supervised = checkpoint.get("target") == "cpwc"
+        kind = checkpoint.get("input", "mean") + ("_vflip" if vflip else "") + ("_sup" if supervised else "")
         if "s2i_scale" in checkpoint:
             kind = "s2i"
         if kind != inputs:
@@ -240,6 +245,7 @@ for inputs in INPUTS:
         name = (
             NAMES[arch] + (" multi-tx" if n_tx else "") + (" vflip" if vflip else "")
             + (" S2I" if kind == "s2i" else "") + (" any-n" if kind.startswith("mean_anyn") else "")
+            + (" supervised" if supervised else "")
         )
         noise = checkpoint.get("noise_level") if kind.startswith("mean_anyn") else None
         models[name] = model, n_tx, kind, noise
