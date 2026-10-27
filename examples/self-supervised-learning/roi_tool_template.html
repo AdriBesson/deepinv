@@ -1,0 +1,320 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Carotid ROI Tool</title>
+<!-- Template of roi_tool_n2i.py, which fills in the frames: open the generated
+     results/n2i_ultrasound_rois/roi_tool.html, not this file. -->
+<style>
+  :root {
+    --bg: #f6f6f4; --panel: #ffffff; --text: #1d1d1b; --muted: #6b6b66; --line: #d9d9d4;
+    --accent: #2f6fdf; --lumen: #e5484d; --wall: #f5a524; --tissue: #12a5c9; --sel: #ffffff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #161615; --panel: #20201f; --text: #ececea; --muted: #9b9b96; --line: #3a3a37; --accent: #6f9cf0; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.4 system-ui, sans-serif; }
+  main { display: grid; grid-template-columns: 260px minmax(0, 1fr) 280px; gap: 16px; padding: 16px; height: 100vh; overflow: hidden; }
+  #stage { min-height: 0; }
+  aside, section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; overflow: auto; }
+  h1 { font-size: 15px; margin: 0 0 8px; }
+  h2 { font-size: 13px; margin: 14px 0 6px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  .frame { display: flex; justify-content: space-between; padding: 5px 8px; border-radius: 6px; cursor: pointer; font-variant-numeric: tabular-nums; }
+  .frame:hover { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+  .frame.active { background: color-mix(in srgb, var(--accent) 22%, transparent); }
+  .frame .n { color: var(--muted); font-size: 12px; }
+  .frame .n.done { color: var(--text); }
+  #stage { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 8px; }
+  canvas { cursor: crosshair; max-width: 100%; image-rendering: pixelated; }
+  #status { margin-top: 6px; color: var(--muted); font-variant-numeric: tabular-nums; min-height: 1.4em; }
+  .row { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
+  button { font: inherit; padding: 5px 10px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--text); cursor: pointer; }
+  button.on { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 20%, transparent); }
+  button.label-lumen.on { border-color: var(--lumen); background: color-mix(in srgb, var(--lumen) 22%, transparent); }
+  button.label-wall.on { border-color: var(--wall); background: color-mix(in srgb, var(--wall) 22%, transparent); }
+  button.label-tissue.on { border-color: var(--tissue); background: color-mix(in srgb, var(--tissue) 22%, transparent); }
+  .roi { display: flex; align-items: center; gap: 6px; padding: 4px 6px; border-radius: 6px; cursor: pointer; }
+  .roi.sel { outline: 1px solid var(--accent); }
+  .swatch { width: 10px; height: 10px; border-radius: 2px; flex: none; }
+  .roi .del { margin-left: auto; padding: 1px 7px; }
+  kbd { font: 12px ui-monospace, monospace; border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; }
+  .help { color: var(--muted); font-size: 12.5px; }
+  .help div { margin: 3px 0; }
+  #msg { font-size: 12.5px; color: var(--muted); margin-top: 6px; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; height: auto; } }
+</style>
+</head>
+<body>
+<main>
+  <aside>
+    <h1>Carotid ROIs</h1>
+    <div class="help">Lumen / wall / tissue per frame</div>
+    <h2>Frames</h2>
+    <div id="frames"></div>
+  </aside>
+  <section id="stage">
+    <canvas id="cv"></canvas>
+    <div id="status"></div>
+  </section>
+  <aside>
+    <h2>Label</h2>
+    <div class="row" id="labels"></div>
+    <h2>Shape</h2>
+    <div class="row">
+      <button id="mode-poly" class="on">Polygon <kbd>P</kbd></button>
+      <button id="mode-rect">Rectangle <kbd>R</kbd></button>
+    </div>
+    <h2>Image</h2>
+    <div class="row">
+      <button id="img-cpwc" class="on">CPWC 87 tx</button>
+      <button id="img-fast">Fast 3 tx</button>
+      <kbd style="align-self:center">I</kbd>
+    </div>
+    <h2>ROIs on this frame</h2>
+    <div id="rois"></div>
+    <h2>File</h2>
+    <div class="row">
+      <button id="save">Save JSON</button>
+      <button id="load">Load JSON</button>
+      <input type="file" id="file" accept=".json,application/json" hidden>
+    </div>
+    <div id="msg"></div>
+    <h2>Keys</h2>
+    <div class="help">
+      <div>Polygon: click vertices; click the first one, <kbd>Enter</kbd> or double-click to close</div>
+      <div><kbd>Backspace</kbd> last vertex · <kbd>Esc</kbd> cancel</div>
+      <div>Rectangle: drag</div>
+      <div><kbd>1</kbd><kbd>2</kbd><kbd>3</kbd> label · <kbd>←</kbd><kbd>→</kbd> frame</div>
+      <div>Click an ROI to select it, <kbd>Del</kbd> deletes it, a label key relabels it</div>
+      <div>Work is kept in this browser; <b>Save JSON</b> writes the file for <code>N2I_ROI_JSON</code></div>
+    </div>
+  </aside>
+</main>
+<script>
+const FRAMES = /*__FRAMES__*/[];
+const CONFIG = /*__CONFIG__*/{};
+const STORE_KEY = "n2i-roi-tool:" + FRAMES.map(f => f.key).join("|");
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const COLOR = l => css("--" + l) || "#ffffff";
+
+let state = { frame: 0, label: CONFIG.labels[0], mode: "poly", image: "cpwc", rois: {}, sel: -1 };
+for (const f of FRAMES) state.rois[f.key] = [];
+let draft = null;           // polygon vertices or rectangle corners in progress
+let cursor = null;          // [x, z] in grid pixels
+const images = {};          // key -> {cpwc: Image, fast: Image}
+const probe = document.createElement("canvas").getContext("2d", { willReadFrequently: true });
+
+try {
+  const kept = JSON.parse(localStorage.getItem(STORE_KEY) || "null");
+  if (kept) for (const k in kept) if (k in state.rois) state.rois[k] = kept[k];
+} catch (e) { /* no storage: start empty */ }
+const persist = () => { try { localStorage.setItem(STORE_KEY, JSON.stringify(state.rois)); } catch (e) {} };
+
+const cv = document.getElementById("cv"), ctx = cv.getContext("2d");
+const frame = () => FRAMES[state.frame];
+const rois = () => state.rois[frame().key];
+
+function loadImage(src) { const im = new Image(); im.src = "data:image/png;base64," + src; return im; }
+for (const f of FRAMES) images[f.key] = { cpwc: loadImage(f.cpwc), fast: loadImage(f.fast) };
+
+// Display size: physical aspect ratio, scaled to the stage height.
+function layout() {
+  const f = frame(), [nz, nx] = f.img_size, [dz, dx] = f.pixel_size;
+  const stage = document.getElementById("stage");
+  const h = Math.max(300, stage.clientHeight - 50);
+  const w = h * (nx * dx) / (nz * dz);
+  const scale = Math.min(1, (stage.clientWidth - 16) / w);
+  cv.style.width = (w * scale) + "px"; cv.style.height = (h * scale) + "px";
+  const dpr = window.devicePixelRatio || 1;
+  cv.width = Math.round(w * scale * dpr); cv.height = Math.round(h * scale * dpr);
+  draw();
+}
+
+const toCanvas = ([x, z]) => [x / frame().img_size[1] * cv.width, z / frame().img_size[0] * cv.height];
+function toGrid(ev) {
+  const r = cv.getBoundingClientRect(), [nz, nx] = frame().img_size;
+  const x = Math.min(nx, Math.max(0, (ev.clientX - r.left) / r.width * nx));
+  const z = Math.min(nz, Math.max(0, (ev.clientY - r.top) / r.height * nz));
+  return [x, z];
+}
+
+function path(points, close) {
+  ctx.beginPath();
+  points.forEach((p, i) => { const [cx, cz] = toCanvas(p); i ? ctx.lineTo(cx, cz) : ctx.moveTo(cx, cz); });
+  if (close) ctx.closePath();
+}
+
+function draw() {
+  const im = images[frame().key][state.image];
+  if (!im.complete) { im.onload = draw; return; }
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(im, 0, 0, cv.width, cv.height);
+  const lw = Math.max(1.5, cv.width / 300);
+  rois().forEach((roi, i) => {
+    path(roi.points, true);
+    ctx.fillStyle = COLOR(roi.label) + "33"; ctx.fill();
+    ctx.lineWidth = i === state.sel ? 2.5 * lw : lw;
+    ctx.strokeStyle = i === state.sel ? css("--sel") : COLOR(roi.label); ctx.stroke();
+  });
+  if (draft) {
+    const pts = state.mode === "rect" ? rectPoints(draft[0], cursor || draft[0])
+                                      : cursor ? [...draft, cursor] : draft;
+    path(pts, state.mode === "rect");
+    ctx.setLineDash([6, 4]); ctx.lineWidth = lw; ctx.strokeStyle = COLOR(state.label); ctx.stroke(); ctx.setLineDash([]);
+    if (state.mode === "poly") for (const p of draft) {
+      const [cx, cz] = toCanvas(p); ctx.fillStyle = COLOR(state.label);
+      ctx.beginPath(); ctx.arc(cx, cz, 2 * lw, 0, 7); ctx.fill();
+    }
+  }
+  status();
+}
+
+function status() {
+  const f = frame(), el = document.getElementById("status");
+  if (!cursor) { el.textContent = f.key; return; }
+  const [x, z] = cursor, [dz, dx] = f.pixel_size;
+  const xmm = -f.x_half * 1e3 + x * dx * 1e3, zmm = f.z_min * 1e3 + z * dz * 1e3;
+  // Brightness under the cursor, read back from the grey-level PNG.
+  const im = images[f.key][state.image], [nz, nx] = f.img_size;
+  probe.canvas.width = nx; probe.canvas.height = nz; probe.drawImage(im, 0, 0);
+  const g = probe.getImageData(Math.min(nx - 1, Math.floor(x)), Math.min(nz - 1, Math.floor(z)), 1, 1).data[0];
+  const db = g / 255 * CONFIG.dynamic_range_db - CONFIG.dynamic_range_db;
+  el.textContent = `${f.key} · x ${xmm.toFixed(1)} mm, z ${zmm.toFixed(1)} mm · ${db.toFixed(0)} dB`;
+}
+
+const rectPoints = ([x0, z0], [x1, z1]) => [[x0, z0], [x1, z0], [x1, z1], [x0, z1]];
+const area = pts => Math.abs(pts.reduce((s, [x, z], i) => { const [x2, z2] = pts[(i + 1) % pts.length]; return s + x * z2 - x2 * z; }, 0)) / 2;
+
+function commit(points, shape) {
+  if (points.length < 3 || area(points) < 4) { msg("ROI too small, discarded"); draft = null; draw(); return; }
+  rois().push({ label: state.label, shape, points: points.map(([x, z]) => [+x.toFixed(2), +z.toFixed(2)]) });
+  // Not selected: the next label key must pick the label of the next ROI, not relabel this one.
+  state.sel = -1; draft = null; persist(); render();
+}
+
+function inside([x, z], pts) {
+  let c = false;
+  for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+    const [xi, zi] = pts[i], [xj, zj] = pts[j];
+    if ((zi > z) !== (zj > z) && x < (xj - xi) * (z - zi) / (zj - zi) + xi) c = !c;
+  }
+  return c;
+}
+
+const near = (a, b) => { const [ax, az] = toCanvas(a), [bx, bz] = toCanvas(b); return Math.hypot(ax - bx, az - bz) < 10 * (window.devicePixelRatio || 1); };
+
+cv.addEventListener("mousedown", ev => {
+  const p = toGrid(ev);
+  if (state.mode === "rect") { draft = [p]; return; }
+  if (!draft) {
+    // A click on an existing ROI selects it rather than starting a polygon.
+    const hit = rois().map((r, i) => i).reverse().find(i => inside(p, rois()[i].points));
+    if (hit !== undefined && !ev.shiftKey) { state.sel = hit; render(); return; }
+    draft = [p]; state.sel = -1; render(); return;
+  }
+  if (draft.length >= 3 && near(p, draft[0])) { commit(draft, "polygon"); return; }
+  draft.push(p); draw();
+});
+cv.addEventListener("mouseup", ev => {
+  if (state.mode !== "rect" || !draft) return;
+  commit(rectPoints(draft[0], toGrid(ev)), "rectangle");
+});
+cv.addEventListener("dblclick", () => { if (state.mode === "poly" && draft && draft.length >= 3) commit(draft, "polygon"); });
+cv.addEventListener("mousemove", ev => { cursor = toGrid(ev); draw(); });
+cv.addEventListener("mouseleave", () => { cursor = null; draw(); });
+
+document.addEventListener("keydown", ev => {
+  if (ev.target.tagName === "INPUT") return;
+  const k = ev.key;
+  if (k >= "1" && k <= String(CONFIG.labels.length)) {
+    const label = CONFIG.labels[+k - 1];
+    if (state.sel >= 0 && !draft) { rois()[state.sel].label = label; persist(); }
+    setLabel(label);
+  } else if (k === "p" || k === "P") setMode("poly");
+  else if (k === "r" || k === "R") setMode("rect");
+  else if (k === "i" || k === "I") setImage(state.image === "cpwc" ? "fast" : "cpwc");
+  else if (k === "Enter" && draft && state.mode === "poly" && draft.length >= 3) commit(draft, "polygon");
+  else if (k === "Escape") { draft = null; draw(); }
+  else if (k === "Backspace" && draft) { draft.pop(); if (!draft.length) draft = null; draw(); ev.preventDefault(); }
+  else if ((k === "Delete" || k === "Backspace") && state.sel >= 0) { removeRoi(state.sel); ev.preventDefault(); }
+  else if (k === "ArrowRight") goto(state.frame + 1);
+  else if (k === "ArrowLeft") goto(state.frame - 1);
+});
+
+function removeRoi(i) { rois().splice(i, 1); state.sel = -1; persist(); render(); }
+function goto(i) { if (i < 0 || i >= FRAMES.length) return; state.frame = i; state.sel = -1; draft = null; render(); layout(); }
+function setLabel(l) { state.label = l; render(); }
+function setMode(m) { state.mode = m; draft = null; render(); }
+function setImage(m) { state.image = m; render(); }
+function msg(t) { document.getElementById("msg").textContent = t; }
+
+function render() {
+  const fl = document.getElementById("frames"); fl.innerHTML = "";
+  FRAMES.forEach((f, i) => {
+    const have = new Set(state.rois[f.key].map(r => r.label));
+    const done = CONFIG.labels.every(l => have.has(l));
+    const d = document.createElement("div");
+    d.className = "frame" + (i === state.frame ? " active" : "");
+    d.innerHTML = `<span>${f.key.replace("volunteer_", "v").replace("/carotid", "")}</span>` +
+      `<span class="n${done ? " done" : ""}">${done ? "✓ " : ""}${state.rois[f.key].length}</span>`;
+    d.onclick = () => goto(i); fl.appendChild(d);
+  });
+  const lb = document.getElementById("labels"); lb.innerHTML = "";
+  CONFIG.labels.forEach((l, i) => {
+    const b = document.createElement("button");
+    b.className = `label-${l}` + (l === state.label ? " on" : "");
+    b.innerHTML = `${l} <kbd>${i + 1}</kbd>`; b.onclick = () => {
+      if (state.sel >= 0) { rois()[state.sel].label = l; persist(); }
+      setLabel(l);
+    };
+    lb.appendChild(b);
+  });
+  document.getElementById("mode-poly").classList.toggle("on", state.mode === "poly");
+  document.getElementById("mode-rect").classList.toggle("on", state.mode === "rect");
+  document.getElementById("img-cpwc").classList.toggle("on", state.image === "cpwc");
+  document.getElementById("img-fast").classList.toggle("on", state.image === "fast");
+  const rl = document.getElementById("rois"); rl.innerHTML = "";
+  if (!rois().length) rl.innerHTML = `<div class="help">None yet</div>`;
+  rois().forEach((r, i) => {
+    const d = document.createElement("div");
+    d.className = "roi" + (i === state.sel ? " sel" : "");
+    d.innerHTML = `<span class="swatch" style="background:${COLOR(r.label)}"></span>${r.label}` +
+      ` <span class="help">${r.shape}, ${Math.round(area(r.points))} px</span>`;
+    const del = document.createElement("button"); del.className = "del"; del.textContent = "×"; del.title = "Delete";
+    del.onclick = e => { e.stopPropagation(); removeRoi(i); };
+    d.appendChild(del); d.onclick = () => { state.sel = i; render(); };
+    rl.appendChild(d);
+  });
+  draw();
+}
+
+document.getElementById("mode-poly").onclick = () => setMode("poly");
+document.getElementById("mode-rect").onclick = () => setMode("rect");
+document.getElementById("img-cpwc").onclick = () => setImage("cpwc");
+document.getElementById("img-fast").onclick = () => setImage("fast");
+document.getElementById("save").onclick = () => {
+  const out = { version: 1, labels: CONFIG.labels, coordinates: "grid pixels: x = column, z = row; pixel (r, c) covers [c, c+1) x [r, r+1)", frames: {} };
+  for (const f of FRAMES) out.frames[f.key] = { img_size: f.img_size, pixel_size: f.pixel_size, rois: state.rois[f.key] };
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([JSON.stringify(out, null, 1)], { type: "application/json" }));
+  a.download = "rois_carotid.json"; a.click(); URL.revokeObjectURL(a.href);
+  const missing = FRAMES.filter(f => !CONFIG.labels.every(l => state.rois[f.key].some(r => r.label === l))).length;
+  msg(missing ? `Saved. ${missing} frame(s) still lack a label.` : "Saved, every frame has all labels.");
+};
+document.getElementById("load").onclick = () => document.getElementById("file").click();
+document.getElementById("file").onchange = async ev => {
+  const file = ev.target.files[0]; if (!file) return;
+  try {
+    const saved = JSON.parse(await file.text()); let n = 0;
+    for (const k in saved.frames) if (k in state.rois) { state.rois[k] = saved.frames[k].rois; n++; }
+    persist(); render(); msg(`Loaded ROIs of ${n} frame(s).`);
+  } catch (e) { msg("Could not read that file."); }
+  ev.target.value = "";
+};
+window.addEventListener("resize", layout);
+render(); layout();
+</script>
+</body>
+</html>
