@@ -2,17 +2,18 @@ r"""
 Noise2Inverse for ultrafast ultrasound -- dark artifacts on the phantom
 =======================================================================
 
-Analysis behind Section V-D and the Discussion of ``summary.md``: the networks
-trained by ``train_n2i_deepinv.py`` darken parts of the homogeneous CIRS 054GS
-phantom (held out of training) that neither the three-transmit input nor CPWC
-shows. Three measurements, on the fast acquisition {-10, 0, +10} deg of
+Analysis behind Sections V-D to V-I and the Discussion of ``summary.md``: the
+networks trained by ``train_n2i_deepinv.py`` (and its multi-transmit, any-n and
+supervised variants) darken parts of the homogeneous CIRS 054GS phantom (held
+out of training) that neither the three-transmit input nor CPWC shows. Five
+measurements, on the fast acquisition {-10, 0, +10} deg of
 ``compare_n2i_deepinv.py``:
 
-1. **Homogeneity** (Table IV). Local brightness of each output against CPWC:
-   the ratio of the two intensities :math:`|x|^2`, each smoothed with a Gaussian
-   of ``SIGMA_PX`` pixels, in dB, minus its median over the frame. Per frame,
-   its minimum and the fraction of the image below ``DARK_DB``; per method, the
-   mean over the frames by depth fifth.
+1. **Homogeneity** (Tables IV, VI, IX, XVIII). Local brightness of each output
+   against CPWC: the ratio of the two intensities :math:`|x|^2`, each smoothed
+   with a Gaussian of ``SIGMA_PX`` pixels, in dB, minus its median over the
+   frame. Per frame, its minimum and the fraction of the image below
+   ``DARK_DB``; per method, the mean over the frames by depth fifth.
 2. **Rescaling** the input by ``GAINS``. A denoiser should satisfy
    :math:`f(a y) = a f(y)`; the script prints the relative error
    :math:`\|f(a y)/a - f(y)\| / \|f(y)\|` and the homogeneity of :math:`f(a y)/a`.
@@ -25,14 +26,28 @@ shows. Three measurements, on the fast acquisition {-10, 0, +10} deg of
    frames, next to the local gain of each network (output against input
    amplitude, dB). An MMSE estimator shrinks its input roughly by this
    correlation.
+4. **Vertical flip** (Tables VII, IX, X). The input is flipped upside down and
+   the output flipped back: the homogeneity of measurement 1 with the flipped
+   input, and the NMSE against the mean of the transmits not in the input, with
+   the plain and the flipped input, on ``N_NMSE`` frames of each of
+   ``NMSE_FOLDERS``.
+5. **Cropping** (Section V-E). The top ``CROP_ROWS`` rows of the input of
+   ``CROP_FRAME`` are removed; the homogeneity is measured on the remaining
+   rows, against CPWC cropped alike. A dark region that stays below the cysts
+   rather than at fixed rows is not caused by the image border.
 
-Tables are printed (pipe them to a log), and written to CSV files with the
-figures in ``OUT_DIR``. Figures are only saved to files, never displayed.
+The networks are chosen as in ``eval_n2i_deepinv.py``: ``INPUTS`` (environment
+variable ``N2I_INPUTS``) selects the kinds of networks, ``N2I_ARCHS`` the
+architectures and ``N2I_RUN_SUFFIX`` the data split; ``N2I_SECTIONS`` runs only
+some of the measurements, e.g. ``N2I_SECTIONS=1,4``. Tables are printed (pipe
+them to a log), and written to CSV files with the figures in ``OUT_DIR``.
+Figures are only saved to files, never displayed.
 """
 
 import csv
 import glob
 import json
+import math
 import os
 
 import matplotlib
@@ -53,9 +68,37 @@ from n2i_models import AttentionResUNet, AttentionUNet, MSDNet, PaddedArtifactRe
 CACHE_ROOT = "/data/n2i_das_cache"  # output of the precompute script
 PHANTOM = "invitro_CIRS054GS/054GS"  # held out of training since round 3
 
+# Kinds of networks to analyse, as in eval_n2i_deepinv.py:
+#   "mean"       baseline networks, fed the mean of the transmits (2 channels)
+#   "transmits"  multi-transmit networks (train_n2i_multitx_deepinv.py), fed
+#                each transmit, sorted by steering angle (2 channels each)
+#   "mean_anyn"  networks of train_n2i_anyn_deepinv.py, fed the mean of the
+#                transmits and told their number through the DRUNet noise level
+# each also trained with vertical flips ("mean_vflip", "transmits_vflip",
+# "mean_anyn_vflip"); and the supervised baselines of train_n2i_deepinv.py with
+# TARGET="cpwc", "mean_sup" and "mean_vflip_sup". The N2I_INPUTS environment
+# variable overrides it, e.g. N2I_INPUTS=mean,transmits,transmits_vflip.
+INPUTS = ["mean"]
+INPUTS = os.environ.get("N2I_INPUTS", ",".join(INPUTS)).split(",")
+# Checkpoint folder suffix of each kind, as in the SAVE_PATH of the training scripts.
+SAVE_SUFFIX = {
+    "mean": "",
+    "transmits": "_multitx",
+    "mean_anyn": "_anyn",
+    "mean_vflip": "_vflip",
+    "transmits_vflip": "_multitx_vflip",
+    "mean_anyn_vflip": "_anyn_vflip",
+    "mean_sup": "_sup",
+    "mean_vflip_sup": "_vflip_sup",
+}
+if not INPUTS or not set(INPUTS) <= set(SAVE_SUFFIX):
+    raise ValueError(f"INPUTS must be among {list(SAVE_SUFFIX)}, got {INPUTS}")
+
 # Networks to analyse, with their checkpoint; None = ``ckp_best`` of the latest
-# training run under ``./checkpoints/n2i_ultrasound_<arch><RUN_SUFFIX>``.
-# Networks without any checkpoint are skipped.
+# training run under ``./checkpoints/n2i_ultrasound_<arch><suffix><RUN_SUFFIX>``
+# for every kind of INPUTS, suffix being its SAVE_SUFFIX. An explicit path is
+# used for the kind its checkpoint records. Networks without any checkpoint are
+# skipped.
 CHECKPOINTS = {
     "unet": None,
     "resunet": None,
@@ -63,8 +106,27 @@ CHECKPOINTS = {
     "drunet": None,
     "msd": None,
 }
-RUN_SUFFIX = "_test002"  # as in the SAVE_PATH of the training script
-OUT_DIR = f"./results/n2i_ultrasound_artifacts{RUN_SUFFIX}"
+# The N2I_ARCHS environment variable keeps only some of them, e.g. N2I_ARCHS=drunet.
+if archs := os.environ.get("N2I_ARCHS"):
+    CHECKPOINTS = {a: CHECKPOINTS.get(a) for a in archs.split(",")}
+# As in the SAVE_PATH of the training script, e.g. "_test002" (round 3) or
+# "_test002_006_008" (round 4); the N2I_RUN_SUFFIX environment variable overrides it.
+RUN_SUFFIX = os.environ.get("N2I_RUN_SUFFIX", "_test002")
+# Each data split and choice of inputs writes to its own folder, as in eval_n2i_deepinv.py.
+TAG = lambda kind: SAVE_SUFFIX[kind].lstrip("_") or "mean"
+OUT_TAG = SAVE_SUFFIX[INPUTS[0]] if len(set(INPUTS)) == 1 else "_" + "_vs_".join(map(TAG, INPUTS))
+OUT_DIR = f"./results/n2i_ultrasound_artifacts{OUT_TAG}{RUN_SUFFIX}"
+NAMES = {
+    "unet": "UNet",
+    "resunet": "ResUNet",
+    "attunet": "AttUNet",
+    "attresunet": "AttResUNet",
+    "drunet": "DRUNet",
+    "msd": "MS-D",
+}
+# Measurements to run (see the docstring); the N2I_SECTIONS environment variable
+# overrides it, e.g. N2I_SECTIONS=4,5.
+SECTIONS = {int(s) for s in os.environ.get("N2I_SECTIONS", "1,2,3,4,5").split(",")}
 
 # Steering angles of the fast acquisition, in degrees, as in compare_n2i_deepinv.py.
 ANGLES_DEG = [-10.0, 0.0, 10.0]
@@ -88,6 +150,21 @@ COHERENCE_FOLDERS = [
     "volunteer_002/carotid",
 ]
 N_COHERENCE = 4
+# Folders of the NMSE flip test, with N_NMSE frames taken at regular steps
+# through each (Table X): the test folders of round 4 and the phantom section.
+NMSE_FOLDERS = [
+    "volunteer_002/carotid",
+    "volunteer_002/abdomen",
+    "volunteer_006/carotid",
+    "volunteer_008/abdomen",
+    "volunteer_008/back",
+    "volunteer_008/carotid",
+    "invitro_CIRS054GS/054GS",
+]
+N_NMSE = 6
+# Cropping test: rows removed from the top of the input of CROP_FRAME.
+CROP_FRAME = HOMOGENEITY_FRAMES[0]
+CROP_ROWS = [0, 64, 128, 192]
 
 SIGMA_PX = 8  # Gaussian smoothing of the intensities, pixels (about 1.2 mm)
 DARK_DB = -3.0  # threshold of the dark area
@@ -108,24 +185,25 @@ device = dinv.utils.get_device()
 # %%
 # Networks
 # --------
-def build_denoiser(arch):
+def build_denoiser(arch, in_channels=2):
+    """``in_channels``: 2 (I and Q) for the baseline, ``2 n_tx`` for multi-transmit."""
     if arch in ("resunet", "attunet", "attresunet"):
         net_cls = {"resunet": ResUNet, "attunet": AttentionUNet, "attresunet": AttentionResUNet}
         return net_cls[arch](
-            in_channels=2, out_channels=2, base_channels=CHANNELS, upsample_mode=UPSAMPLE
+            in_channels=in_channels, out_channels=2, base_channels=CHANNELS, upsample_mode=UPSAMPLE
         )
     if arch == "unet":
         return dinv.models.UNet(
-            in_channels=2,
+            in_channels=in_channels,
             out_channels=2,
             scales=SCALES,
             channels_per_scale=[CHANNELS * 2**k for k in range(SCALES)],
-            residual=RESIDUAL,
+            residual=RESIDUAL and in_channels == 2,  # needs as many in as out channels
             batch_norm=False,
         )
     if arch == "drunet":
         return dinv.models.DRUNet(
-            in_channels=2,
+            in_channels=in_channels,
             out_channels=2,
             nc=[CHANNELS * 2**k for k in range(4)],
             nb=BLOCKS,
@@ -133,7 +211,7 @@ def build_denoiser(arch):
         )
     if arch == "msd":
         return MSDNet(
-            in_channels=2,
+            in_channels=in_channels,
             out_channels=2,
             depth=MSD_DEPTH,
             width=MSD_WIDTH,
@@ -142,56 +220,101 @@ def build_denoiser(arch):
     raise ValueError(f"Unknown arch {arch!r}")
 
 
-def find_checkpoint(arch):
-    save_path = f"./checkpoints/n2i_ultrasound_{arch}{RUN_SUFFIX}"
+def find_checkpoint(arch, suffix):
+    save_path = f"./checkpoints/n2i_ultrasound_{arch}{suffix}{RUN_SUFFIX}"
     found = sorted(glob.glob(os.path.join(save_path, "*", "ckp_best.pth.tar")))
     return found[-1] if found else None
 
 
+# name -> (model, n_tx, noise), n_tx = None for a network fed the mean of the
+# transmits, noise the noise-level rule of an any-n network (None otherwise).
 models = {}
-for arch, ckpt_path in CHECKPOINTS.items():
-    ckpt_path = ckpt_path or find_checkpoint(arch)
-    if ckpt_path is None:
-        print(f"{arch}: no checkpoint found, skipped")
-        continue
-    checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
-    model = PaddedArtifactRemoval(
-        build_denoiser(arch),
-        mode="direct",
-        device=device,
-        scale_equivariant=checkpoint.get("scale_equivariant", False),
-    )
-    model.load_state_dict(checkpoint["state_dict"])
-    model.eval()
-    models[arch] = model
-    print(f"{arch}: {ckpt_path} (epoch {checkpoint['epoch']}, scale-equivariant: {model.scale_equivariant})")
+for inputs in INPUTS:
+    for arch, ckpt_path in CHECKPOINTS.items():
+        ckpt_path = ckpt_path or find_checkpoint(arch, SAVE_SUFFIX[inputs])
+        if ckpt_path is None:
+            print(f"{NAMES[arch]} ({inputs}): no checkpoint found, skipped")
+            continue
+        checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
+        # Baseline checkpoints have no "input" key, older ones no "vflip" or "target".
+        vflip = checkpoint.get("augmentation", {}).get("vflip", False)
+        supervised = checkpoint.get("target") == "cpwc"
+        kind = checkpoint.get("input", "mean") + ("_vflip" if vflip else "") + ("_sup" if supervised else "")
+        if kind not in SAVE_SUFFIX:
+            raise ValueError(f"{ckpt_path}: a '{kind}' network, not one of {list(SAVE_SUFFIX)}")
+        if kind != inputs:
+            if CHECKPOINTS[arch] is None:
+                raise ValueError(f"{ckpt_path}: a '{kind}' checkpoint, not '{inputs}'")
+            continue  # explicit path, loaded in the loop of its own kind
+        n_tx = checkpoint["n_tx"] if checkpoint.get("input") == "transmits" else None
+        if n_tx is not None and n_tx != len(ANGLES_DEG):
+            print(f"{ckpt_path}: trained on {n_tx} transmits, not {len(ANGLES_DEG)}, skipped")
+            continue
+        model = PaddedArtifactRemoval(
+            build_denoiser(arch, 2 * n_tx if n_tx else 2),
+            mode="direct",
+            device=device,
+            scale_equivariant=checkpoint.get("scale_equivariant", False),
+        )
+        model.load_state_dict(checkpoint["state_dict"])
+        model.eval()
+        anyn = checkpoint.get("input") == "mean_anyn"
+        name = (
+            NAMES[arch] + (" multi-tx" if n_tx else "") + (" any-n" if anyn else "")
+            + (" vflip" if vflip else "") + (" supervised" if supervised else "")
+        )
+        models[name] = model, n_tx, checkpoint["noise_level"] if anyn else None
+        print(
+            f"{name}: {ckpt_path} (epoch {checkpoint['epoch']}, scale-equivariant: {model.scale_equivariant})"
+        )
 if not models:
     raise RuntimeError("No checkpoint found for any network")
 os.makedirs(OUT_DIR, exist_ok=True)
+W = max(11, *(len(name) for name in models))  # width of the name column
 
 
-def denoise(model, fast, sigma=DRUNET_SIGMA):
-    """Denoise a ``(Z, X)`` complex image; ``sigma`` only matters for DRUNet."""
-    physics = dinv.physics.Denoising(dinv.physics.GaussianNoise(sigma)).to(device)
-    net_in = torch.view_as_real(fast).permute(2, 0, 1)[None].to(device)
+def denoise(name, tx, gain=1.0, scale_sigma=False, flip=False):
+    """Denoise the ``(n, Z, X)`` complex transmits ``tx`` (by increasing angle).
+
+    The input is multiplied by ``gain`` and, with ``flip``, flipped upside
+    down; the output is flipped back but not divided by the gain. The DRUNet
+    noise level is ``DRUNET_SIGMA``, or that of ``n`` transmits for an any-n
+    network, times ``gain`` with ``scale_sigma``; other networks ignore it.
+    """
+    model, n_tx, noise = models[name]
+    sigma = DRUNET_SIGMA if noise is None else noise["sigma_ref"] * math.sqrt(noise["n_ref"] / len(tx))
+    physics = dinv.physics.Denoising(dinv.physics.GaussianNoise(sigma * (gain if scale_sigma else 1.0)))
+    tx = tx.flip(-2) if flip else tx
+    if n_tx is None:
+        net_in = torch.view_as_real(tx.mean(0) * gain).permute(2, 0, 1)
+    else:
+        net_in = torch.view_as_real(tx * gain).permute(0, 3, 1, 2).flatten(0, 1)
     with torch.no_grad():
-        out = model(net_in, physics)[0].cpu()
-    return torch.complex(out[0], out[1])
+        out = model(net_in[None].to(device), physics.to(device))[0].cpu()
+    out = torch.complex(out[0], out[1])
+    return out.flip(-2) if flip else out
 
 
 # %%
 # Measurements
 # ------------
 def load(rel, stem):
-    """Fast input, CPWC and mean of the other transmits of a cached frame."""
+    """Fast transmits ``(n, Z, X)`` by increasing angle, CPWC and mean of the other transmits."""
     folder = os.path.join(CACHE_ROOT, rel)
     with open(os.path.join(folder, "manifest.json")) as f:
         manifest = json.load(f)
     angles_deg = np.asarray(manifest["angles_deg"])
-    fast_idx = [int(np.abs(angles_deg - a).argmin()) for a in ANGLES_DEG]
+    # By increasing angle: the channel order of the multi-transmit networks.
+    fast_idx = sorted((int(np.abs(angles_deg - a).argmin()) for a in ANGLES_DEG), key=angles_deg.__getitem__)
     rest = [a for a in range(len(angles_deg)) if a not in fast_idx]
     planes = torch.from_numpy(np.load(os.path.join(folder, stem + ".npy")))
-    return planes[fast_idx].mean(0), planes.mean(0), planes[rest].mean(0), manifest
+    return planes[fast_idx], planes.mean(0), planes[rest].mean(0), manifest
+
+
+def folder_stems(rel, n):
+    """``n`` frames taken at regular steps through a folder."""
+    stems = sorted(os.path.basename(f)[:-4] for f in glob.glob(os.path.join(CACHE_ROOT, rel, "invi*_*.npy")))
+    return stems[:: max(1, len(stems) // n)][:n]
 
 
 def smooth(img):
@@ -216,6 +339,10 @@ def coherence(a, b):
     return num / np.sqrt(smooth(np.abs(a) ** 2) * smooth(np.abs(b) ** 2))
 
 
+def nmse_db(img, ref):
+    return 10 * math.log10(float((img - ref).abs().pow(2).sum() / ref.abs().pow(2).sum()))
+
+
 def bands(img):
     """Mean of a ``(Z, X)`` map over each depth band."""
     return [band.mean() for band in np.array_split(img, DEPTH_BANDS, axis=0)]
@@ -232,149 +359,233 @@ def write_csv(name, rows):
         writer.writerows(rows)
 
 
+def homogeneity(flip=False):
+    """Brightness maps and per-frame rows of measurement 1, plain or flipped input."""
+    methods = (["DAS"] if not flip else []) + list(models)
+    maps, rows = {m: [] for m in methods}, []
+    for stem in HOMOGENEITY_FRAMES:
+        tx, cpwc, _, manifest = load(PHANTOM, stem)
+        outputs = ({"DAS": tx.mean(0)} if not flip else {}) | {name: denoise(name, tx, flip=flip) for name in models}
+        for m, img in outputs.items():
+            r = brightness_db(img.numpy(), cpwc.numpy())
+            maps[m].append(r)
+            darkest, area = dark(r)
+            rows.append({"frame": stem, "method": m, "flipped_input": flip, "darkest_db": darkest,
+                         "dark_area_pct": area, "deepest_fifth_db": bands(r)[-1]})
+    return methods, maps, rows, manifest
+
+
+def print_homogeneity(methods, rows):
+    for m in methods:
+        sel = [r for r in rows if r["method"] == m]
+        d, a = [r["darkest_db"] for r in sel], [r["dark_area_pct"] for r in sel]
+        print(
+            f"  {m:{W}s} {min(d):6.1f} to {max(d):6.1f} dB   {min(a):5.1f}-{max(a):5.1f}% ({np.mean(a):4.1f}%)"
+            f"   deepest fifth {np.mean([r['deepest_fifth_db'] for r in sel]):+5.2f} dB"
+        )
+
+
 band_header = " ".join(f"{f'z{i + 1}':>6s}" for i in range(DEPTH_BANDS))
 
 # %%
 # 1. Homogeneity
 # --------------
-methods = ["DAS"] + list(models)
-maps = {m: [] for m in methods}
-rows = []
-for stem in HOMOGENEITY_FRAMES:
-    fast, cpwc, _, manifest = load(PHANTOM, stem)
-    outputs = {"DAS": fast} | {arch: denoise(model, fast) for arch, model in models.items()}
-    for m, img in outputs.items():
-        r = brightness_db(img.numpy(), cpwc.numpy())
-        maps[m].append(r)
-        darkest, area = dark(r)
-        rows.append({"frame": stem, "method": m, "darkest_db": darkest, "dark_area_pct": area})
-write_csv("homogeneity.csv", rows)
+if 1 in SECTIONS:
+    methods, maps, rows, manifest = homogeneity()
+    write_csv("homogeneity.csv", rows)
+    print(
+        f"\n1. Homogeneity on {len(HOMOGENEITY_FRAMES)} frames of {PHANTOM}: local brightness against CPWC, "
+        f"darkest point (dB) and area below {DARK_DB:.0f} dB, range over the frames (mean)"
+    )
+    print_homogeneity(methods, rows)
+    print(f"Mean over the frames by depth band, shallow to deep (dB):\n  {'':{W}s} {band_header}")
+    for m in methods:
+        print(f"  {m:{W}s} " + " ".join(f"{v:6.2f}" for v in bands(np.mean(maps[m], 0))))
 
-print(
-    f"\n1. Homogeneity on {len(HOMOGENEITY_FRAMES)} frames of {PHANTOM}: local brightness against CPWC, "
-    f"darkest point (dB) and area below {DARK_DB:.0f} dB, range over the frames (mean)"
-)
-for m in methods:
-    d = [r["darkest_db"] for r in rows if r["method"] == m]
-    a = [r["dark_area_pct"] for r in rows if r["method"] == m]
-    print(f"  {m:11s} {min(d):6.1f} to {max(d):6.1f} dB   {min(a):5.1f}-{max(a):5.1f}% ({np.mean(a):4.1f}%)")
-print(f"Mean over the frames by depth band, shallow to deep (dB):\n  {'':11s} {band_header}")
-for m in methods:
-    print(f"  {m:11s} " + " ".join(f"{v:6.2f}" for v in bands(np.mean(maps[m], 0))))
-
-extent = [
-    -manifest["x_half"] * 1e3, manifest["x_half"] * 1e3,
-    manifest["z_max"] * 1e3, manifest["z_min"] * 1e3,
-]
-fig, ax = plt.subplots(2, len(methods), figsize=(3 * len(methods), 11), squeeze=False)
-for j, m in enumerate(methods):
-    for i, (img, title) in enumerate(
-        [(maps[m][0], HOMOGENEITY_FRAMES[0]), (np.mean(maps[m], 0), f"mean of {len(HOMOGENEITY_FRAMES)} frames")]
-    ):
-        im = ax[i, j].imshow(img, cmap="RdBu_r", vmin=-8, vmax=8, extent=extent)
-        ax[i, j].set_title(f"{m}, {title}", fontsize=9)
-fig.colorbar(im, ax=ax, shrink=0.6, label="local intensity vs CPWC (dB)")
-fig.savefig(os.path.join(OUT_DIR, "homogeneity_maps.png"), dpi=110)
-plt.close(fig)
+    extent = [
+        -manifest["x_half"] * 1e3, manifest["x_half"] * 1e3,
+        manifest["z_max"] * 1e3, manifest["z_min"] * 1e3,
+    ]
+    fig, ax = plt.subplots(2, len(methods), figsize=(3 * len(methods), 11), squeeze=False)
+    for j, m in enumerate(methods):
+        for i, (img, title) in enumerate(
+            [(maps[m][0], HOMOGENEITY_FRAMES[0]), (np.mean(maps[m], 0), f"mean of {len(HOMOGENEITY_FRAMES)} frames")]
+        ):
+            im = ax[i, j].imshow(img, cmap="RdBu_r", vmin=-8, vmax=8, extent=extent)
+            ax[i, j].set_title(f"{m}, {title}", fontsize=9)
+    fig.colorbar(im, ax=ax, shrink=0.6, label="local intensity vs CPWC (dB)")
+    fig.savefig(os.path.join(OUT_DIR, "homogeneity_maps.png"), dpi=110)
+    plt.close(fig)
 
 # %%
 # 2. Rescaling the input
 # ----------------------
-# Every variant: the networks as they are, and DRUNet with its noise level
-# scaled like the input, when its wrapper does not already make it equivariant.
-variants = {arch: (model, False) for arch, model in models.items()}
-if "drunet" in models and not models["drunet"].scale_equivariant:
-    variants["drunet, sigma x gain"] = (models["drunet"], True)
+if 2 in SECTIONS:
+    # Every variant: the networks as they are, and each DRUNet with its noise
+    # level scaled like the input, when its wrapper does not already make it
+    # equivariant.
+    variants = {name: (name, False) for name in models}
+    for name, (model, _, _) in models.items():
+        if name.startswith(NAMES["drunet"]) and not model.scale_equivariant:
+            variants[f"{name}, sigma x gain"] = (name, True)
 
-rows, gain_maps = [], {}
-for stem in GAIN_FRAMES:
-    fast, cpwc, _, _ = load(PHANTOM, stem)
-    for name, (model, scale_sigma) in variants.items():
-        ref = denoise(model, fast)
+    rows, gain_maps = [], {}
+    for stem in GAIN_FRAMES:
+        tx, cpwc, _, _ = load(PHANTOM, stem)
+        for variant, (name, scale_sigma) in variants.items():
+            ref = denoise(name, tx)
+            for g in GAINS:
+                out = denoise(name, tx, gain=g, scale_sigma=scale_sigma) / g
+                r = brightness_db(out.numpy(), cpwc.numpy())
+                darkest, area = dark(r)
+                error = float((out - ref).abs().norm() / ref.abs().norm())
+                rows.append({"frame": stem, "network": variant, "gain": g, "equivariance_error": error,
+                             "darkest_db": darkest, "dark_area_pct": area})
+                if stem == GAIN_FRAMES[0]:
+                    gain_maps[(variant, g)] = r
+    write_csv("rescaling.csv", rows)
+
+    VW = max(21, *(len(v) for v in variants))
+    print(
+        f"\n2. Rescaling on {len(GAIN_FRAMES)} frames: per gain, equivariance error, darkest point (dB) "
+        f"and area below {DARK_DB:.0f} dB, means over the frames"
+    )
+    print(f"  {'':{VW}s}" + "".join(f"{'x' + str(g):>22s}" for g in GAINS))
+    for variant in variants:
+        cells = []
         for g in GAINS:
-            sigma = DRUNET_SIGMA * g if scale_sigma else DRUNET_SIGMA
-            out = denoise(model, fast * g, sigma) / g
-            r = brightness_db(out.numpy(), cpwc.numpy())
-            darkest, area = dark(r)
-            error = float((out - ref).abs().norm() / ref.abs().norm())
-            rows.append({"frame": stem, "network": name, "gain": g, "equivariance_error": error,
-                         "darkest_db": darkest, "dark_area_pct": area})
-            if stem == GAIN_FRAMES[0]:
-                gain_maps[(name, g)] = r
-write_csv("rescaling.csv", rows)
+            sel = [r for r in rows if r["network"] == variant and r["gain"] == g]
+            cells.append(
+                f"{np.mean([r['equivariance_error'] for r in sel]):7.3f} "
+                f"{np.mean([r['darkest_db'] for r in sel]):6.1f} "
+                f"{np.mean([r['dark_area_pct'] for r in sel]):5.1f}%"
+            )
+        print(f"  {variant:{VW}s}" + "  ".join(cells))
 
-print(
-    f"\n2. Rescaling on {len(GAIN_FRAMES)} frames: per gain, equivariance error, darkest point (dB) "
-    f"and area below {DARK_DB:.0f} dB, means over the frames"
-)
-print(f"  {'':21s}" + "".join(f"{'x' + str(g):>22s}" for g in GAINS))
-for name in variants:
-    cells = []
-    for g in GAINS:
-        sel = [r for r in rows if r["network"] == name and r["gain"] == g]
-        cells.append(
-            f"{np.mean([r['equivariance_error'] for r in sel]):7.3f} "
-            f"{np.mean([r['darkest_db'] for r in sel]):6.1f} "
-            f"{np.mean([r['dark_area_pct'] for r in sel]):5.1f}%"
-        )
-    print(f"  {name:21s}" + "  ".join(cells))
-
-fig, ax = plt.subplots(len(variants), len(GAINS), figsize=(2.4 * len(GAINS), 3.6 * len(variants)), squeeze=False)
-for i, name in enumerate(variants):
-    for j, g in enumerate(GAINS):
-        ax[i, j].imshow(gain_maps[(name, g)], cmap="RdBu_r", vmin=-8, vmax=8)
-        ax[i, j].set_title(f"{name} x{g}", fontsize=8)
-        ax[i, j].axis("off")
-fig.suptitle(f"{GAIN_FRAMES[0]}: local intensity vs CPWC (dB), input x gain, output / gain")
-fig.savefig(os.path.join(OUT_DIR, "rescaling_maps.png"), dpi=90)
-plt.close(fig)
+    fig, ax = plt.subplots(len(variants), len(GAINS), figsize=(2.4 * len(GAINS), 3.6 * len(variants)), squeeze=False)
+    for i, variant in enumerate(variants):
+        for j, g in enumerate(GAINS):
+            ax[i, j].imshow(gain_maps[(variant, g)], cmap="RdBu_r", vmin=-8, vmax=8)
+            ax[i, j].set_title(f"{variant} x{g}", fontsize=8)
+            ax[i, j].axis("off")
+    fig.suptitle(f"{GAIN_FRAMES[0]}: local intensity vs CPWC (dB), input x gain, output / gain")
+    fig.savefig(os.path.join(OUT_DIR, "rescaling_maps.png"), dpi=90)
+    plt.close(fig)
 
 # %%
 # 3. Coherence with the rest of the sequence
 # ------------------------------------------
-print(
-    f"\n3. Coherence of the input with the other transmits, and local gain of each network "
-    f"(output against input, dB), by depth band\n  {'':31s} {band_header}"
-)
-rows = []
-fig, axs = plt.subplots(1, 2, figsize=(12, 5))
-for rel in COHERENCE_FOLDERS:
-    stems = sorted(os.path.basename(f)[:-4] for f in glob.glob(os.path.join(CACHE_ROOT, rel, "invi*_*.npy")))
-    if rel == PHANTOM:
-        stems = GAIN_FRAMES
-    elif rel.startswith("invitro"):
-        stems = stems[::30][:N_COHERENCE]
-    else:
-        stems = stems[:: max(1, len(stems) // N_COHERENCE)][:N_COHERENCE]
-    cohs, gains = [], {arch: [] for arch in models}
-    for stem in stems:
-        fast, _, rest, manifest = load(rel, stem)
-        cohs.append(coherence(fast.numpy(), rest.numpy()))
-        for arch, model in models.items():
-            gains[arch].append(local_gain_db(denoise(model, fast).numpy(), fast.numpy()))
-    coh = np.mean(cohs, 0)
-    print(f"  {rel} ({len(stems)} frames)\n  {'  coherence':31s} " + " ".join(f"{v:6.2f}" for v in bands(coh)))
-    rows.append({"folder": rel, "quantity": "coherence"} | {f"z{i + 1}": v for i, v in enumerate(bands(coh))})
-    for arch in models:
-        g = np.mean(gains[arch], 0)
-        print(f"  {'  ' + arch:31s} " + " ".join(f"{v:6.2f}" for v in bands(g)))
-        rows.append({"folder": rel, "quantity": f"gain_db {arch}"} | {f"z{i + 1}": v for i, v in enumerate(bands(g))})
-    z_mm = np.linspace(manifest["z_min"], manifest["z_max"], coh.shape[0]) * 1e3
-    axs[0].plot(z_mm, coh.mean(1), label=rel)
-    axs[1].plot(z_mm, np.mean(gains[next(iter(models))], 0).mean(1), label=rel)
-write_csv("coherence.csv", rows)
-axs[0].set(xlabel="depth (mm)", ylabel="coherence", title="3-tx input vs other transmits")
-axs[1].set(xlabel="depth (mm)", ylabel="dB", title=f"{next(iter(models))}: output / input amplitude")
-for a in axs:
-    a.legend(fontsize=7)
-fig.savefig(os.path.join(OUT_DIR, "coherence_depth.png"), dpi=100)
-plt.close(fig)
+if 3 in SECTIONS:
+    print(
+        f"\n3. Coherence of the input with the other transmits, and local gain of each network "
+        f"(output against input, dB), by depth band\n  {'':{W + 4}s} {band_header}"
+    )
+    rows = []
+    fig, axs = plt.subplots(1, 2, figsize=(12, 5))
+    for rel in COHERENCE_FOLDERS:
+        stems = sorted(os.path.basename(f)[:-4] for f in glob.glob(os.path.join(CACHE_ROOT, rel, "invi*_*.npy")))
+        if rel == PHANTOM:
+            stems = GAIN_FRAMES
+        elif rel.startswith("invitro"):
+            stems = stems[::30][:N_COHERENCE]
+        else:
+            stems = stems[:: max(1, len(stems) // N_COHERENCE)][:N_COHERENCE]
+        cohs, gains = [], {name: [] for name in models}
+        for stem in stems:
+            tx, _, rest, manifest = load(rel, stem)
+            fast = tx.mean(0)
+            cohs.append(coherence(fast.numpy(), rest.numpy()))
+            for name in models:
+                gains[name].append(local_gain_db(denoise(name, tx).numpy(), fast.numpy()))
+        coh = np.mean(cohs, 0)
+        print(f"  {rel} ({len(stems)} frames)\n  {'  coherence':{W + 4}s} " + " ".join(f"{v:6.2f}" for v in bands(coh)))
+        rows.append({"folder": rel, "quantity": "coherence"} | {f"z{i + 1}": v for i, v in enumerate(bands(coh))})
+        for name in models:
+            g = np.mean(gains[name], 0)
+            print(f"  {'  ' + name:{W + 4}s} " + " ".join(f"{v:6.2f}" for v in bands(g)))
+            rows.append({"folder": rel, "quantity": f"gain_db {name}"} | {f"z{i + 1}": v for i, v in enumerate(bands(g))})
+        z_mm = np.linspace(manifest["z_min"], manifest["z_max"], coh.shape[0]) * 1e3
+        axs[0].plot(z_mm, coh.mean(1), label=rel)
+        axs[1].plot(z_mm, np.mean(gains[next(iter(models))], 0).mean(1), label=rel)
+    write_csv("coherence.csv", rows)
+    axs[0].set(xlabel="depth (mm)", ylabel="coherence", title="3-tx input vs other transmits")
+    axs[1].set(xlabel="depth (mm)", ylabel="dB", title=f"{next(iter(models))}: output / input amplitude")
+    for a in axs:
+        a.legend(fontsize=7)
+    fig.savefig(os.path.join(OUT_DIR, "coherence_depth.png"), dpi=100)
+    plt.close(fig)
 
-# Do the dark regions on the phantom follow a loss of coherence?
-fast, _, rest, _ = load(PHANTOM, HOMOGENEITY_FRAMES[0])
-coh = coherence(fast.numpy(), rest.numpy())
-print(f"\n{HOMOGENEITY_FRAMES[0]}: pixel-wise correlation of the coherence with the local gain of each network")
-for arch, model in models.items():
-    g = local_gain_db(denoise(model, fast).numpy(), fast.numpy())
-    print(f"  {arch:11s} r = {np.corrcoef(coh.ravel(), g.ravel())[0, 1]:+.2f}")
+    # Do the dark regions on the phantom follow a loss of coherence?
+    tx, _, rest, _ = load(PHANTOM, HOMOGENEITY_FRAMES[0])
+    fast = tx.mean(0)
+    coh = coherence(fast.numpy(), rest.numpy())
+    print(f"\n{HOMOGENEITY_FRAMES[0]}: pixel-wise correlation of the coherence with the local gain of each network")
+    for name in models:
+        g = local_gain_db(denoise(name, tx).numpy(), fast.numpy())
+        print(f"  {name:{W}s} r = {np.corrcoef(coh.ravel(), g.ravel())[0, 1]:+.2f}")
+
+# %%
+# 4. Vertical flip
+# ----------------
+if 4 in SECTIONS:
+    methods, maps, rows, manifest = homogeneity(flip=True)
+    write_csv("flip_homogeneity.csv", rows)
+    print(
+        f"\n4a. Homogeneity with the input flipped upside down (output flipped back), same frames and "
+        f"columns as 1"
+    )
+    print_homogeneity(methods, rows)
+    print("Per frame with the flipped input, dark area (%) / darkest point (dB):")
+    for name in models:
+        cells = []
+        for stem in HOMOGENEITY_FRAMES:
+            r = next(r for r in rows if r["frame"] == stem and r["method"] == name)
+            cells.append(f"{stem[-5:]}: {r['dark_area_pct']:.1f}%/{r['darkest_db']:.1f}")
+        print(f"  {name:{W}s} " + "  ".join(cells))
+
+    print(
+        f"\n4b. NMSE (dB) against the mean of the transmits not in the input, {N_NMSE} frames per folder at "
+        f"regular steps; plain / flipped input"
+    )
+    print(f"  {'folder':26s} {'DAS':>7s} " + " ".join(f"{name:>{max(17, len(name))}s}" for name in models))
+    rows = []
+    for rel in NMSE_FOLDERS:
+        das, res = [], {name: ([], []) for name in models}
+        for stem in folder_stems(rel, N_NMSE):
+            tx, _, rest, _ = load(rel, stem)
+            das.append(nmse_db(tx.mean(0), rest))
+            for name in models:
+                res[name][0].append(nmse_db(denoise(name, tx), rest))
+                res[name][1].append(nmse_db(denoise(name, tx, flip=True), rest))
+            rows.append({"folder": rel, "frame": stem, "method": "DAS", "nmse_db": das[-1], "nmse_flipped_db": ""})
+            rows += [{"folder": rel, "frame": stem, "method": name, "nmse_db": res[name][0][-1],
+                      "nmse_flipped_db": res[name][1][-1]} for name in models]
+        print(f"  {rel:26s} {np.mean(das):7.2f} " + " ".join(
+            f"{f'{np.mean(res[n][0]):.2f} / {np.mean(res[n][1]):.2f}':>{max(17, len(n))}s}" for n in models
+        ), flush=True)
+    write_csv("flip_nmse.csv", rows)
+
+# %%
+# 5. Cropping the top of the input
+# --------------------------------
+if 5 in SECTIONS:
+    tx, cpwc, _, _ = load(PHANTOM, CROP_FRAME)
+    rows = []
+    for c in CROP_ROWS:
+        for m in ["DAS"] + list(models):
+            out = tx[:, c:].mean(0) if m == "DAS" else denoise(m, tx[:, c:])
+            darkest, area = dark(brightness_db(out.numpy(), cpwc[c:].numpy()))
+            rows.append({"rows_removed": c, "method": m, "darkest_db": darkest, "dark_area_pct": area})
+    write_csv("crop.csv", rows)
+    print(
+        f"\n5. {CROP_FRAME} with the top rows of the input removed: dark area (%) / darkest point (dB) "
+        f"on the remaining rows, against CPWC cropped alike"
+    )
+    print(f"  {'':{W}s}" + "".join(f"{f'-{c} rows':>16s}" for c in CROP_ROWS))
+    for m in ["DAS"] + list(models):
+        print(f"  {m:{W}s}" + "".join(
+            f"{f'{r['dark_area_pct']:.1f}% / {r['darkest_db']:.1f}':>16s}"
+            for r in rows if r["method"] == m
+        ))
+
 print(f"\nTables and figures written to {OUT_DIR}")
