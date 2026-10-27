@@ -35,6 +35,19 @@ measurements, on the fast acquisition {-10, 0, +10} deg of
    ``CROP_FRAME`` are removed; the homogeneity is measured on the remaining
    rows, against CPWC cropped alike. A dark region that stays below the cysts
    rather than at fixed rows is not caused by the image border.
+6. **Consistency across groups** (Discussion, *Temporal consistency*). The
+   ``K`` interleaved groups of one acquisition are ``K`` images of the same
+   scene with independent noise. Every group is denoised and, in the signal
+   region (CPWC above ``SIGNAL_DB``), the script measures across the outputs
+   the coefficient of variation of the envelope, the incoherence
+   :math:`1 - |\bar y|^2 / \overline{|y|^2}`, and the lag-one correlation
+   between groups adjacent in time, :math:`R_1 = \overline{y_{g+1} y_g^*}`
+   normalised, as a Doppler estimator would: its magnitude and the spread of
+   its phase (the phase-noise floor of a static scene), for DAS, each network
+   and the compounds of ``COMPOUND_SPLIT`` disjoint interleaved subsets of the
+   transmits. On the phantom frames of measurement 1, the dark area
+   of each group and of their union show whether the dark regions move from one
+   group to the next.
 
 The networks are chosen as in ``eval_n2i_deepinv.py``: ``INPUTS`` (environment
 variable ``N2I_INPUTS``) selects the kinds of networks, ``N2I_ARCHS`` the
@@ -126,7 +139,7 @@ NAMES = {
 }
 # Measurements to run (see the docstring); the N2I_SECTIONS environment variable
 # overrides it, e.g. N2I_SECTIONS=4,5.
-SECTIONS = {int(s) for s in os.environ.get("N2I_SECTIONS", "1,2,3,4,5").split(",")}
+SECTIONS = {int(s) for s in os.environ.get("N2I_SECTIONS", "1,2,3,4,5,6").split(",")}
 
 # Steering angles of the fast acquisition, in degrees, as in compare_n2i_deepinv.py.
 ANGLES_DEG = [-10.0, 0.0, 10.0]
@@ -165,6 +178,16 @@ N_NMSE = 6
 # Cropping test: rows removed from the top of the input of CROP_FRAME.
 CROP_FRAME = HOMOGENEITY_FRAMES[0]
 CROP_ROWS = [0, 64, 128, 192]
+
+# Consistency across groups: the partition of the training script, the folders
+# (N_CONSISTENCY frames spread over each) and the number of disjoint compounds
+# (each the mean of 87 / COMPOUND_SPLIT interleaved transmits) to compare with.
+K = 29
+GROUPS = [list(range(j, 87, K)) for j in range(K)]
+CONSISTENCY_FOLDERS = NMSE_FOLDERS
+N_CONSISTENCY = 4
+COMPOUND_SPLIT = 3
+SIGNAL_DB = -40.0  # signal region: CPWC envelope above this, relative to its maximum
 
 SIGMA_PX = 8  # Gaussian smoothing of the intensities, pixels (about 1.2 mm)
 DARK_DB = -3.0  # threshold of the dark area
@@ -587,5 +610,80 @@ if 5 in SECTIONS:
             f"{f'{r['dark_area_pct']:.1f}% / {r['darkest_db']:.1f}':>16s}"
             for r in rows if r["method"] == m
         ))
+
+# %%
+# 6. Consistency across the groups of one acquisition
+# ---------------------------------------------------
+def consistency(images, signal):
+    """Stability of a stack ``(G, Z, X)`` of complex images of the same scene, in ``signal``."""
+    y = images[:, signal]  # (G, pixels)
+    power = (np.abs(y) ** 2).mean(0)
+    r1 = (y[1:] * y[:-1].conj()).mean(0) / np.sqrt((np.abs(y[1:]) ** 2).mean(0) * (np.abs(y[:-1]) ** 2).mean(0))
+    phase = np.angle(r1, deg=True)
+    return {
+        "envelope_cv": float((np.abs(y).std(0) / np.abs(y).mean(0)).mean()),
+        "incoherence": float((1 - np.abs(y.mean(0)) ** 2 / power).mean()),
+        "r1_magnitude": float(np.abs(r1).mean()),
+        "r1_phase_std_deg": float(np.sqrt((phase**2).mean())),  # about 0: RMS = spread
+    }
+
+
+if 6 in SECTIONS:
+    methods = ["DAS", *models, f"DAS {87 // COMPOUND_SPLIT} tx"]
+    rows, phantom_rows = [], []
+    for rel in CONSISTENCY_FOLDERS:
+        stems = HOMOGENEITY_FRAMES if rel == PHANTOM else folder_stems(rel, N_CONSISTENCY)
+        with open(os.path.join(CACHE_ROOT, rel, "manifest.json")) as f:
+            angles_deg = np.asarray(json.load(f)["angles_deg"])
+        for stem in stems:
+            planes = torch.from_numpy(np.load(os.path.join(CACHE_ROOT, rel, stem + ".npy")))
+            cpwc = planes.mean(0)
+            env = cpwc.abs().numpy()
+            signal = 20 * np.log10(env / env.max()) > SIGNAL_DB
+            stacks = {m: [] for m in methods}
+            for g in GROUPS:
+                tx = planes[sorted(g, key=angles_deg.__getitem__)]
+                stacks["DAS"].append(tx.mean(0))
+                for name in models:
+                    stacks[name].append(denoise(name, tx))
+            stacks[methods[-1]] = [planes[r::COMPOUND_SPLIT].mean(0) for r in range(COMPOUND_SPLIT)]
+            for m, stack in stacks.items():
+                stack = torch.stack(stack).numpy()
+                rows.append({"folder": rel, "frame": stem, "method": m} | consistency(stack, signal))
+                if rel == PHANTOM and m in models:
+                    dark_maps = [brightness_db(img, cpwc.numpy()) < DARK_DB for img in stack]
+                    areas = [100 * d.mean() for d in dark_maps]
+                    phantom_rows.append({"frame": stem, "method": m, "mean_area_pct": np.mean(areas),
+                                         "min_area_pct": min(areas), "max_area_pct": max(areas),
+                                         "union_area_pct": 100 * np.any(dark_maps, 0).mean(),
+                                         "intersection_area_pct": 100 * np.all(dark_maps, 0).mean()})
+        print(f"6. {rel}: {len(stems)} frames done", flush=True)
+    write_csv("consistency.csv", rows)
+    keys = ["envelope_cv", "incoherence", "r1_magnitude", "r1_phase_std_deg"]
+    MW = max(W, len(methods[-1]))
+    print(
+        f"\n6. Consistency of the outputs of the {K} groups of one acquisition, in the signal region "
+        f"(CPWC above {SIGNAL_DB:.0f} dB), mean over the frames; the last row compounds "
+        f"{COMPOUND_SPLIT} disjoint sets of {87 // COMPOUND_SPLIT} transmits"
+    )
+    for rel in CONSISTENCY_FOLDERS:
+        print(f"  {rel}\n  {'':{MW}s} " + " ".join(f"{k:>17s}" for k in keys))
+        for m in methods:
+            sel = [r for r in rows if r["folder"] == rel and r["method"] == m]
+            print(f"  {m:{MW}s} " + " ".join(f"{np.mean([r[k] for r in sel]):17.3f}" for k in keys))
+    if phantom_rows:
+        write_csv("consistency_phantom_dark.csv", phantom_rows)
+        print(
+            f"\nPhantom, dark area (< {DARK_DB:.0f} dB against CPWC) of each of the {K} groups: mean, range over "
+            f"the groups, union and intersection of the {K} dark regions; mean over the frames (%)"
+        )
+        for name in models:
+            sel = [r for r in phantom_rows if r["method"] == name]
+            mean = lambda k: np.mean([r[k] for r in sel])
+            print(
+                f"  {name:{W}s} mean {mean('mean_area_pct'):5.1f}  range {mean('min_area_pct'):5.1f}-"
+                f"{mean('max_area_pct'):5.1f}  union {mean('union_area_pct'):5.1f}  "
+                f"intersection {mean('intersection_area_pct'):5.1f}"
+            )
 
 print(f"\nTables and figures written to {OUT_DIR}")

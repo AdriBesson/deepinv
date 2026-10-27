@@ -30,6 +30,15 @@ with
   input on volunteer 005, carotid) and cannot be compared with this one;
 - the median GPU time per frame (batch 1, fp32, after warm-up).
 
+With ``ROI_JSON`` (environment variable ``N2I_ROI_JSON``), the ROIs drawn with
+``roi_tool_n2i.py`` are scored too: lumen against tissue and wall against lumen
+(contrast, CNR, gCNR) and the speckle SNR of the tissue, on the fast input.
+
+With ``LOSS_GROUPS`` (environment variable ``N2I_LOSS_GROUPS``, e.g. ``all``),
+the loss of the interleaved input is also computed against each of these
+groups alone and against the mean of all the groups but 0, to see whether the
+ranking of the networks depends on the angles of the target.
+
 Per-frame values go to a CSV per folder; the script prints, per folder, the
 mean and standard deviation of every metric and the paired differences of each
 network from ``REFERENCE`` (mean, fraction of frames on which the network is
@@ -48,7 +57,9 @@ import torch.nn.functional as F
 from scipy.stats import wilcoxon
 
 import deepinv as dinv
+from n2i_invitro import gcnr
 from n2i_models import AttentionResUNet, AttentionUNet, MSDNet, PaddedArtifactRemoval, ResUNet
+from roi_tool_n2i import roi_masks
 
 # %%
 # Configuration
@@ -59,6 +70,13 @@ CACHE_ROOT = "/data/n2i_das_cache"  # output of the precompute script
 # Volunteer 008 was never trained on; 006 carotid was in the round-3 validation set
 # (checkpoint selection, early stopping), so its round-3 scores are slightly optimistic.
 EVAL_DIRS = ["volunteer_002", "volunteer_006", "volunteer_008"]  # test volunteers
+# The N2I_EVAL_DIRS environment variable overrides it; empty (N2I_EVAL_DIRS=)
+# skips the scoring of whole folders, e.g. to compute the ROI metrics alone.
+if (eval_dirs := os.environ.get("N2I_EVAL_DIRS")) is not None:
+    EVAL_DIRS = [d for d in eval_dirs.split(",") if d]
+# ROIs drawn with roi_tool_n2i.py (lumen, wall, tissue); when set, the ROI
+# metrics of the fast input are computed on their frames (N2I_ROI_JSON).
+ROI_JSON = os.environ.get("N2I_ROI_JSON")
 
 # Kinds of networks to score, any of
 #   "mean"       baseline networks, fed the mean of the transmits (2 channels)
@@ -120,6 +138,13 @@ REFERENCE = os.environ.get("N2I_REFERENCE", "UNet")
 # group 0 -> group 1 the N2I loss.
 K = 29
 GROUPS = [list(range(j, 87, K)) for j in range(K)]
+# Groups the N2I loss of the interleaved input is also computed against, each
+# alone, next to the mean of all the groups but 0; the N2I_LOSS_GROUPS
+# environment variable sets them, e.g. "2,28" or "all" (groups 1 to K - 1).
+# Group 1 mirrors the angles of group 0; group 2 is the nearest in angle. Only
+# group 1 enters the tables above; the others get their own table and CSV.
+LOSS_GROUPS = os.environ.get("N2I_LOSS_GROUPS", "1")
+LOSS_GROUPS = list(range(1, K)) if LOSS_GROUPS == "all" else [int(g) for g in LOSS_GROUPS.split(",")]
 # Steering angles of the fast acquisition, in degrees; each is mapped to the
 # nearest transmit of the sequence (0.38 deg steps between -16.3 and +16.3).
 ANGLES_DEG = [-10.0, 0.0, 10.0]
@@ -133,6 +158,8 @@ UPSAMPLE = "bilinear"  # ported nets only
 MSD_DEPTH, MSD_WIDTH, MSD_DILATION = 100, 1, 10  # msd only
 
 N_FRAMES = None  # cap on frames per folder (None = all)
+if (n_frames := os.environ.get("N2I_N_FRAMES")) is not None:  # e.g. N2I_N_FRAMES=4 for a quick test
+    N_FRAMES = None if n_frames == "all" else int(n_frames)
 DYNAMIC_RANGE_DB = 50.0
 
 device = dinv.utils.get_device()
@@ -285,7 +312,7 @@ def score_folder(cache_dir, manifest):
     for model, n_tx in models.values():  # warm-up, so the first frame is timed fairly
         run(model, to_channels(zeros, n_tx))
 
-    rows, times = [], {name: [] for name in models}
+    rows, group_rows, times = [], [], {name: [] for name in models}
     for path in files:
         planes = np.load(path, mmap_mode="r")  # (n_angles, Z, X) complex64
         row = {"frame": os.path.basename(path)}
@@ -306,8 +333,16 @@ def score_folder(cache_dir, manifest):
                 target = torch.view_as_real(torch.from_numpy(planes[GROUPS[1]].mean(0)))
                 for name, img in outs.items():
                     row[f"{name} N2I loss"] = F.mse_loss(torch.view_as_real(img), target).item()
+                if LOSS_GROUPS != [1]:
+                    group_row = {"frame": row["frame"]}
+                    targets = {f"g{j}": planes[GROUPS[j]].mean(0) for j in LOSS_GROUPS} | {"rest": ref.numpy()}
+                    for tag, target in targets.items():
+                        target = torch.view_as_real(torch.from_numpy(target))
+                        for name, img in outs.items():
+                            group_row[f"{name} loss {tag}"] = F.mse_loss(torch.view_as_real(img), target).item()
+                    group_rows.append(group_row)
         rows.append(row)
-    return rows, {name: 1e3 * np.median(t) for name, t in times.items()}
+    return rows, group_rows, {name: 1e3 * np.median(t) for name, t in times.items()}
 
 
 def report(rows, times):
@@ -345,6 +380,32 @@ def report(rows, times):
         print(f"| {name} | {' | '.join(cells)} |")
 
 
+def report_groups(group_rows, manifest):
+    """Loss of the interleaved input against each group of LOSS_GROUPS, and against the rest."""
+    angles_deg = np.asarray(manifest["angles_deg"])
+    g0 = np.sort(angles_deg[GROUPS[0]])
+    values = lambda name, tag: np.array([r[f"{name} loss {tag}"] for r in group_rows])
+    names = ["DAS", *models]
+    print(f"\nLoss of the interleaved input (group 0, {', '.join(f'{a:+.2f}' for a in g0)} deg) against single "
+          f"groups and the rest; distance = mean |angle - angle of group 0| (sorted), in deg")
+    others = [n for n in models if n != REFERENCE]
+    print(f"| Target | Angles (deg) | Distance | {' | '.join(names)} | "
+          + " | ".join(f"Δ {n} (better)" for n in others) + " |")
+    print(f"|---|---|---:|{'---:|' * len(names)}{'---|' * len(others)}")
+    for tag in [f"g{j}" for j in LOSS_GROUPS] + ["rest"]:
+        if tag == "rest":
+            angles, distance = "mean of groups 1–28", "—"
+        else:
+            a = np.sort(angles_deg[GROUPS[int(tag[1:])]])
+            angles, distance = ", ".join(f"{x:+.2f}" for x in a), f"{np.abs(a - g0).mean():.2f}"
+        cells = [f"{values(n, tag).mean():.4f}" for n in names]
+        if REFERENCE in models:
+            for n in others:
+                diff = values(n, tag) - values(REFERENCE, tag)
+                cells.append(f"{diff.mean():+.4f} ({np.mean(diff < 0) * 100:.0f}%)")
+        print(f"| {tag} | {angles} | {distance} | {' | '.join(cells)} |")
+
+
 # %%
 # Score every folder
 # ------------------
@@ -356,9 +417,11 @@ for folder in EVAL_DIRS:
         with open(manifest_path) as f:
             manifest = json.load(f)
         print(f"\n{rel}:")
-        rows, times = score_folder(cache_dir, manifest)
+        rows, group_rows, times = score_folder(cache_dir, manifest)
         print(f"  {len(rows)} frames\n")
         report(rows, times)
+        if group_rows:
+            report_groups(group_rows, manifest)
 
         out_dir = os.path.join(OUT_DIR, rel)
         os.makedirs(out_dir, exist_ok=True)
@@ -367,3 +430,69 @@ for folder in EVAL_DIRS:
             writer.writeheader()
             writer.writerows(rows)
         print(f"\nPer-frame metrics written to {out_dir}/metrics.csv")
+        if group_rows:
+            with open(os.path.join(out_dir, "loss_groups.csv"), "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=list(group_rows[0]))
+                writer.writeheader()
+                writer.writerows(group_rows)
+            print(f"Per-frame losses against single groups written to {out_dir}/loss_groups.csv")
+
+
+# %%
+# ROI metrics
+# -----------
+# On the envelope |x| of the fast input, its denoising and CPWC, in the
+# hand-drawn ROIs: lumen against tissue and wall against lumen (contrast, CNR,
+# gCNR as in n2i_invitro.py), and the speckle SNR mean / std in the tissue ROI
+# (1.91 for fully developed speckle, higher where the speckle is smoothed).
+def roi_metrics(env, masks):
+    out = {}
+    for a_label, b_label in [("lumen", "tissue"), ("wall", "lumen")]:
+        if a_label in masks and b_label in masks:
+            a, b = env[masks[a_label]], env[masks[b_label]]
+            key = f"{a_label}/{b_label}"
+            out[f"{key} contrast_db"] = 20 * np.log10(a.mean() / b.mean())
+            out[f"{key} cnr"] = abs(a.mean() - b.mean()) / np.sqrt(a.var() + b.var())
+            out[f"{key} gcnr"] = gcnr(a, b)
+    if "tissue" in masks:
+        t = env[masks["tissue"]]
+        out["tissue speckle_snr"] = t.mean() / t.std()
+    return out
+
+
+if ROI_JSON:
+    masks_by_frame = roi_masks(ROI_JSON)
+    roi_rows = []
+    for key, masks in masks_by_frame.items():
+        folder, stem = key.rsplit("/", 1)
+        with open(os.path.join(CACHE_ROOT, folder, "manifest.json")) as f:
+            manifest = json.load(f)
+        angles_deg = np.asarray(manifest["angles_deg"])
+        fast = sorted((int(np.abs(angles_deg - a).argmin()) for a in ANGLES_DEG), key=angles_deg.__getitem__)
+        planes = np.load(os.path.join(CACHE_ROOT, folder, stem + ".npy"), mmap_mode="r")
+        tx = torch.from_numpy(planes[fast])
+        images = {"DAS": tx.mean(0)}
+        for name, (model, n_tx) in models.items():
+            images[name] = to_complex(run(model, to_channels(tx, n_tx))[0], tx.shape[1:])
+        images["CPWC"] = torch.from_numpy(np.asarray(planes).mean(0))
+        for name, img in images.items():
+            roi_rows.append({"frame": key, "method": name} | roi_metrics(img.abs().double().numpy(), masks))
+
+    metric_keys = [k for k in roi_rows[0] if k not in ("frame", "method")]
+    methods = list(dict.fromkeys(r["method"] for r in roi_rows))
+    print(f"\nROI metrics, fast input, {len(masks_by_frame)} frames of {ROI_JSON}: mean ± std over the frames")
+    print(f"| Method | {' | '.join(metric_keys)} |")
+    print(f"|---{'|---:' * len(metric_keys)}|")
+    for m in methods:
+        cells = []
+        for k in metric_keys:
+            v = np.array([r[k] for r in roi_rows if r["method"] == m and k in r])
+            cells.append(f"{v.mean():.2f} ± {v.std():.2f}" if len(v) else "—")
+        print(f"| {m} | {' | '.join(cells)} |")
+    out = os.path.join(OUT_DIR, "roi_metrics.csv")
+    os.makedirs(OUT_DIR, exist_ok=True)
+    with open(out, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["frame", "method", *metric_keys])
+        writer.writeheader()
+        writer.writerows(roi_rows)
+    print(f"Per-frame ROI metrics written to {out}")
