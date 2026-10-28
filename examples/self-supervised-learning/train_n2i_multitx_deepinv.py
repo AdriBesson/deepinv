@@ -92,7 +92,11 @@ INVITRO_TEST = True
 # the number of input channels (2 per transmit).
 K = 29
 GROUPS = [list(range(j, 87, K)) for j in range(K)]
-TARGET = "others"  # "others" (mean of all the other transmits) or "group"
+# "others" (mean of all the other transmits), "group", or "cpwc": the supervised
+# baseline of train_n2i_deepinv.py (target = the mean of all 87 transmits, input
+# group included, also for validation and test; runs save under a "_sup" folder).
+# The N2I_TARGET environment variable overrides it.
+TARGET = os.environ.get("N2I_TARGET", "others")
 VAL_PAIRS = [(0, 1), (2, 3), (4, 5), (6, 7)]
 
 SCALES = 4  # unet only
@@ -110,7 +114,10 @@ AUG_GAIN_DB = 0.0 if SCALE_EQUIVARIANT else 10.0
 # train_n2i_deepinv.py); it leaves the steering angles, hence the channel order,
 # unchanged. N2I_VFLIP=0 resumes or reproduces a run without it.
 AUG_VFLIP = os.environ.get("N2I_VFLIP", "1") != "0"
-SAVE_PATH = f"./checkpoints/n2i_ultrasound_{ARCH}_multitx{'_vflip' if AUG_VFLIP else ''}{RUN_SUFFIX}"
+SAVE_PATH = (
+    f"./checkpoints/n2i_ultrasound_{ARCH}_multitx{'_vflip' if AUG_VFLIP else ''}"
+    f"{'_sup' if TARGET == 'cpwc' else ''}{RUN_SUFFIX}"
+)
 
 # Optimisation
 EPOCHS = 100
@@ -198,7 +205,12 @@ class MultiTransmitDataset(Dataset):
             data = np.load(self.files[idx // len(self.pairs)], mmap_mode="r")
             j, k = self.pairs[idx % len(self.pairs)]
         inp = self.group(data, j)  # (n_j, 2, Z, X)
-        if self.train and TARGET == "others":
+        if TARGET == "cpwc":
+            if self.source == "tx":
+                tgt = torch.from_numpy(np.array(data[-1]))
+            else:
+                tgt = torch.view_as_real(torch.from_numpy(np.array(data)).mean(0)).permute(2, 0, 1)
+        elif self.train and TARGET == "others":
             # Mean of the transmits outside group j, from the mean over all of them.
             n, n_j = self.n_total, inp.shape[0]
             tgt = (n * torch.from_numpy(np.array(data[-1])) - inp.sum(0)) / (n - n_j)
@@ -264,7 +276,7 @@ if any(not np.allclose(m["angles_deg"], angles_deg) for m in manifests):
 flat = sorted(a for g in GROUPS for a in g)
 if flat != sorted(set(flat)) or not set(flat) <= set(range(manifest["n_angles"])):
     raise ValueError("GROUPS must be disjoint subsets of the transmit indices")
-if TARGET not in ("others", "group"):
+if TARGET not in ("others", "group", "cpwc"):
     raise ValueError(f"Unknown TARGET {TARGET!r}")
 
 # %%
@@ -427,6 +439,7 @@ class ResumableTrainer(dinv.Trainer):
         # The evaluation scripts rebuild the model and its input from these.
         extra = {
             "scale_equivariant": SCALE_EQUIVARIANT,
+            "target": TARGET,
             "augmentation": {
                 "tgc_db": AUG_TGC_DB,
                 "tgc_knots": AUG_TGC_KNOTS,
@@ -497,7 +510,7 @@ if test_files:
             loss_identity.append(F.mse_loss(y_mean, x).item())
     print(
         f"Test on {len(test_files)} frames from {TEST_DIRS}: "
-        f"N2I loss {np.mean(loss_n2i):.4f} (identity {np.mean(loss_identity):.4f})"
+        f"{'loss against CPWC' if TARGET == 'cpwc' else 'N2I loss'} {np.mean(loss_n2i):.4f} (identity {np.mean(loss_identity):.4f})"
     )
 
 

@@ -83,7 +83,8 @@ ROI_JSON = os.environ.get("N2I_ROI_JSON")
 #   "transmits"  multi-transmit networks, fed each transmit (2 channels each)
 # and the same trained with vertical-flip augmentation, "mean_vflip" and
 # "transmits_vflip"; and the supervised baselines of train_n2i_deepinv.py with
-# TARGET="cpwc", "mean_sup" and "mean_vflip_sup". The N2I_INPUTS environment
+# TARGET="cpwc", "mean_sup" and "mean_vflip_sup" ("transmits_sup" for those of
+# train_n2i_multitx_deepinv.py). The N2I_INPUTS environment
 # variable overrides it, e.g. N2I_INPUTS=mean,transmits,transmits_vflip.
 INPUTS = ["mean"]
 INPUTS = os.environ.get("N2I_INPUTS", ",".join(INPUTS)).split(",")
@@ -95,6 +96,7 @@ SAVE_SUFFIX = {
     "transmits_vflip": "_multitx_vflip",
     "mean_sup": "_sup",
     "mean_vflip_sup": "_vflip_sup",
+    "transmits_sup": "_multitx_sup",
 }
 if not INPUTS or not set(INPUTS) <= set(SAVE_SUFFIX):
     raise ValueError(f"INPUTS must be among {list(SAVE_SUFFIX)}, got {INPUTS}")

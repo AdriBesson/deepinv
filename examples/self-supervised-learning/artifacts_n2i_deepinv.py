@@ -89,7 +89,8 @@ PHANTOM = "invitro_CIRS054GS/054GS"  # held out of training since round 3
 #                transmits and told their number through the DRUNet noise level
 # each also trained with vertical flips ("mean_vflip", "transmits_vflip",
 # "mean_anyn_vflip"); and the supervised baselines of train_n2i_deepinv.py with
-# TARGET="cpwc", "mean_sup" and "mean_vflip_sup". The N2I_INPUTS environment
+# TARGET="cpwc", "mean_sup" and "mean_vflip_sup" ("transmits_sup" for those of
+# train_n2i_multitx_deepinv.py). The N2I_INPUTS environment
 # variable overrides it, e.g. N2I_INPUTS=mean,transmits,transmits_vflip.
 INPUTS = ["mean"]
 INPUTS = os.environ.get("N2I_INPUTS", ",".join(INPUTS)).split(",")
@@ -103,6 +104,7 @@ SAVE_SUFFIX = {
     "mean_anyn_vflip": "_anyn_vflip",
     "mean_sup": "_sup",
     "mean_vflip_sup": "_vflip_sup",
+    "transmits_sup": "_multitx_sup",
 }
 if not INPUTS or not set(INPUTS) <= set(SAVE_SUFFIX):
     raise ValueError(f"INPUTS must be among {list(SAVE_SUFFIX)}, got {INPUTS}")

@@ -66,6 +66,7 @@ from n2i_models import AttentionResUNet, AttentionUNet, MSDNet, PaddedArtifactRe
 # -------------
 CACHE_ROOT = "/data/n2i_das_cache"  # output of the precompute script
 GROUP_CACHE_ROOT = "/data/n2i_group_cache"  # sub-reconstructions, built by this script
+TX_CACHE_ROOT = "/data/n2i_tx_cache"  # of train_n2i_multitx_deepinv.py, used for K = 87
 
 # Network. Each architecture keeps its own checkpoints.
 #   "unet"       deepinv U-Net, concatenating skips, ``SCALES`` deep
@@ -114,6 +115,10 @@ RESUME = "auto"
 # Round 3 (RUN_SUFFIX "_test002") validated on 005 + 006 carotid and tested on 002.
 VAL_DIRS = ["volunteer_005"]
 TEST_DIRS = ["volunteer_002", "volunteer_006", "volunteer_008"]  # empty skips the test
+# N2I_TEST=0 skips it too, so that a run with another K caches no test frames
+# (eval_n2i_deepinv.py tests from the per-transmit cache anyway).
+if os.environ.get("N2I_TEST", "1") == "0":
+    TEST_DIRS = []
 TRAIN_DIRS = ["volunteer_001", "volunteer_003", "volunteer_004", "volunteer_007"]  # None = all the rest
 # CIRS phantom (``invitro_*`` folders): every cached frame but the test frame
 # invitro_02162 of n2i_invitro.py and INVITRO_HELD_OUT joins the training set.
@@ -131,8 +136,19 @@ INVITRO_TEST = True
 # so the sub-reconstructions differ in noise rather than in point spread
 # function. Replace ``GROUPS`` by any list of disjoint lists of transmit indices
 # (acquisition order: alternating +/-, widest angle first, 0 deg last).
-K = 29
+# The N2I_K environment variable overrides K (runs with K != 29 save under a
+# "_K<K>" folder); the groups then have 87 // K or 87 // K + 1 transmits. With
+# K = 87 (single transmits), the transmit cache of train_n2i_multitx_deepinv.py
+# serves as the group cache: same layout, so no 300 GB copy of it is made.
+K = int(os.environ.get("N2I_K", 29))
 GROUPS = [list(range(j, 87, K)) for j in range(K)]
+if K == 87:
+    groups_29 = [list(range(j, 87, 29)) for j in range(29)]
+    tx_root = os.path.join(
+        TX_CACHE_ROOT, "K29_" + hashlib.sha1(json.dumps(groups_29).encode()).hexdigest()[:10]
+    )
+    with open(os.path.join(tx_root, "layout.json")) as fh:
+        GROUPS = [[t] for t in json.load(fh)["ordered_transmits"]]
 # Training target for an input sub-reconstruction:
 #   "others"  the mean of all the other groups (the X:1 strategy of
 #             Noise2Inverse): same expectation as a single group, but its noise
@@ -189,9 +205,18 @@ AUG_GAIN_DB = 0.0 if SCALE_EQUIVARIANT else 10.0
 # input is flipped upside down. The N2I_VFLIP environment variable overrides it
 # (N2I_VFLIP=0 to resume or reproduce a round-4 run).
 AUG_VFLIP = os.environ.get("N2I_VFLIP", "1") != "0"
+# Seed of the weight initialisation and of the training pairs. Runs with another
+# seed than 0 (N2I_SEED) save under a "_seed<n>" folder, so that RESUME = "auto"
+# never continues the run of another seed.
+SEED = int(os.environ.get("N2I_SEED", 0))
+# Linear learning-rate warm-up over the first WARMUP_EPOCHS epochs, on top of the
+# cosine annealing (0 = none, as in rounds 1-4); runs with a warm-up save under a
+# "_warmup<n>" folder. The N2I_WARMUP environment variable overrides it.
+WARMUP_EPOCHS = int(os.environ.get("N2I_WARMUP", 0))
 SAVE_PATH = (
     f"./checkpoints/n2i_ultrasound_{ARCH}{'_vflip' if AUG_VFLIP else ''}"
-    f"{'_sup' if TARGET == 'cpwc' else ''}{RUN_SUFFIX}"
+    f"{'_sup' if TARGET == 'cpwc' else ''}{RUN_SUFFIX}{f'_K{K}' if K != 29 else ''}"
+    f"{f'_warmup{WARMUP_EPOCHS}' if WARMUP_EPOCHS else ''}{f'_seed{SEED}' if SEED else ''}"
 )
 
 # Optimisation
@@ -201,7 +226,6 @@ LR = 1e-3
 GRAD_CLIP = 1.0
 EARLY_STOP_PATIENCE = 30  # epochs without validation improvement
 NUM_WORKERS = 4
-SEED = 0
 
 DYNAMIC_RANGE_DB = 50.0  # for the B-mode preview
 
@@ -341,6 +365,8 @@ group_root = os.path.join(
     GROUP_CACHE_ROOT,
     f"K{len(GROUPS)}_" + hashlib.sha1(json.dumps(GROUPS).encode()).hexdigest()[:10],
 )
+if K == 87:
+    group_root = tx_root
 group_path = lambda f: os.path.join(group_root, os.path.relpath(f, CACHE_ROOT))
 
 
@@ -443,7 +469,14 @@ model = PaddedArtifactRemoval(
 )
 
 optimizer = torch.optim.Adam(model.parameters(), lr=LR)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+if WARMUP_EPOCHS:
+    # Closed form in the epoch, so a resumed run picks up the schedule exactly.
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lambda e: min(1.0, (e + 1) / WARMUP_EPOCHS) * (1 + math.cos(math.pi * e / EPOCHS)) / 2,
+    )
+else:
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
 
 
 # %%
@@ -509,6 +542,8 @@ class ResumableTrainer(dinv.Trainer):
         extra = {
             "scale_equivariant": SCALE_EQUIVARIANT,
             "target": TARGET,
+            "groups": GROUPS,
+            "warmup_epochs": WARMUP_EPOCHS,
             "augmentation": {
                 "tgc_db": AUG_TGC_DB,
                 "tgc_knots": AUG_TGC_KNOTS,

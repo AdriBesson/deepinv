@@ -70,7 +70,8 @@ INPUT_DIRS = ["volunteer_002/carotid", "volunteer_006/carotid", "volunteer_008"]
 #   "mean_anyn"  networks of train_n2i_anyn_deepinv.py, fed the mean of any
 #                number of transmits ("mean_anyn_vflip" with vertical flips)
 #   "mean_sup"   supervised baselines of train_n2i_deepinv.py with TARGET="cpwc"
-#                ("mean_vflip_sup" with vertical flips)
+#                ("mean_vflip_sup" with vertical flips); "transmits_sup" those of
+#                train_n2i_multitx_deepinv.py
 # The N2I_INPUTS environment variable overrides it, e.g. N2I_INPUTS=transmits or
 # N2I_INPUTS=mean,s2i.
 INPUTS = ["transmits_vflip"]
@@ -86,6 +87,7 @@ SAVE_SUFFIX = {
     "mean_anyn_vflip": "_anyn_vflip",
     "mean_sup": "_sup",
     "mean_vflip_sup": "_vflip_sup",
+    "transmits_sup": "_multitx_sup",
 }
 # Checkpoint folder prefix, s2i_ultrasound for train_s2i_deepinv.py.
 SAVE_PREFIX = {"s2i": "s2i_ultrasound"}
